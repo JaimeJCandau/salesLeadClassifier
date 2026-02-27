@@ -9,10 +9,11 @@ node_modules/
 # Runtime/output artifacts
 output/
 results.csv
+domains.csv
 
 # OS/editor noise
 .DS_Store
 *.log
 
 # Legacy credentials and sensitive files
-Older Classifier/*
+Older Classifier/*domains.csv
