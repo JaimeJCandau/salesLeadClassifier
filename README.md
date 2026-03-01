@@ -1,18 +1,23 @@
+## TOP LINE SUMMARY
+Local script to segmenet/classify domains with a combination of Local and AI to optimise cost
+
+
 ## Problem being solved
-Sales team has a massive set of potential leads
+- Our HubSpot has thousands of "Companies", but they are not classified/segmented 
 This script
-- Semantically classifies to define sales approach
+- Semantically classifies/segments them to define individual sales approach
 - Generates a ultra light file with semantics, so that an AI can easily personalise messages (without the cost of parsing each site fully)
 
 
 
 ## How It Works - TOP LINE
 For every domain, it
-- Identifies the resolving URL
-- Fetches HTML using Pupeteer
+- Identifies the resolving URL (also used to identify adquisitions, closed companies, etc...)
+- Fetches HTML using Pupeteer (hugely cheaper than AI)
 - Extract Metas, Menu, Visible text, etc...
 - Sends it all in a Prompt to OpenAI to classify
-- NOTE: The extraction is done locally (very cheap), and the AI is fed with that. This is hugely cheaper
+
+This way: (1) DATA EXTRACTION is done locally (very cheap), and (2) CLASSIFICATION/SEGMENTATION relies on taht with a much cheaper prompt 
 
 
 ## How It Works - HOW SCRIPTS ARE ORCHESTRATED
@@ -44,6 +49,9 @@ Results in root `results.csv` are upserted by `raw_domain` (latest run replaces 
 - `processed_at_utc`
 - `raw_domain`
 - `resolving_url`
+- `activeSite`
+- `redorectedURL`
+- `linkedinURL`
 - `txt_name`
 - `classification`
 - `confidence`
@@ -57,32 +65,16 @@ Required environment variables in `.env`:
 
 Optional:
 - `OPENAI_MODEL=gpt-5-mini`
+- `AI_CLASSIFY_MAX_ATTEMPTS=4` (retries per domain on transient OpenAI/parse issues)
+- `AI_RETRY_BASE_DELAY_MS=1200` (base backoff between retries)
 
-This was tested end-to-end with 2 rows and worked correctly.
 
-## Setup
 
-```bash
-npm install
-cp .env.example .env
-```
 
-## Run Overnight
+## REQUIREMENTS
+- Local installed npm
+- OpenAI API Token
+- Time... (I just left it running overnight)
 
-```bash
-node runFetchPipeline.js domains.csv
-```
-
-## Optional Quick Test
-
-```bash
-node runFetchPipeline.js domains.csv 10
-```
-
-The optional second argument is a row limit.
-
-## Run AI Step Only
-
-```bash
-node aiClassification.js output/fetch_results_YYYYMMDD_HHMMSS.jsonl
-```
+## Run it....
+"node runFetchPipeline.js domains.csv 10"

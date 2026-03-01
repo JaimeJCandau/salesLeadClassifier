@@ -9,6 +9,7 @@ const RESULTS_HEADERS = [
   "resolving_url",
   "activeSite",
   "redorectedURL",
+  "linkedinURL",
   "txt_name",
   "classification",
   "confidence",
@@ -72,9 +73,15 @@ Rules:
 - Return results in a JSON with classification and confidence
 
 This is the information you have about the website`;
+const DEFAULT_CLASSIFY_MAX_ATTEMPTS = 4;
+const DEFAULT_RETRY_BASE_DELAY_MS = 1200;
 
 function safeString(value) {
   return String(value ?? "").trim();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function parseJsonl(filePath) {
@@ -211,6 +218,19 @@ function parseCsvLine(line) {
   return values;
 }
 
+function extractLinkedinUrlFromPayload(payloadText) {
+  const text = String(payloadText ?? "");
+  if (!text) return "";
+
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^\s*linkedinurl\s*:\s*(.*)\s*$/i);
+    if (!match) continue;
+    return safeString(match[1]);
+  }
+  return "";
+}
+
 function loadExistingResults() {
   if (!fs.existsSync(RESULTS_CSV_PATH)) return [];
   const raw = fs.readFileSync(RESULTS_CSV_PATH, "utf8");
@@ -233,6 +253,7 @@ function loadExistingResults() {
       resolvingUrl: safeString(columns[headerColumns.indexOf("resolving_url")]),
       activeSite: safeString(columns[headerColumns.indexOf("activeSite")]) || "FALSE",
       redorectedURL: safeString(columns[headerColumns.indexOf("redorectedURL")]) || "FALSE",
+      linkedinURL: safeString(columns[headerColumns.indexOf("linkedinURL")]),
       txtName: "",
       classification: safeString(columns[headerColumns.indexOf("classification")]),
       confidence: safeString(columns[headerColumns.indexOf("confidence")]),
@@ -267,6 +288,7 @@ function writeResults(rows) {
       row.resolvingUrl,
       row.activeSite,
       row.redorectedURL,
+      row.linkedinURL,
       row.txtName,
       row.classification,
       row.confidence,
@@ -292,6 +314,14 @@ function extractResponseText(payload) {
   if (typeof payload?.output_text === "string" && payload.output_text.trim()) {
     return payload.output_text.trim();
   }
+  if (Array.isArray(payload?.output_text)) {
+    const joined = payload.output_text
+      .map((part) => safeString(part))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+    if (joined) return joined;
+  }
 
   // Some models return already-parsed structured outputs.
   if (payload?.output_parsed && typeof payload.output_parsed === "object") {
@@ -301,6 +331,10 @@ function extractResponseText(payload) {
   const output = Array.isArray(payload?.output) ? payload.output : [];
   const parts = [];
   for (const item of output) {
+    if (typeof item?.output_text === "string" && safeString(item.output_text)) {
+      parts.push(safeString(item.output_text));
+    }
+
     const content = Array.isArray(item?.content) ? item.content : [];
     for (const part of content) {
       if (part?.parsed && typeof part.parsed === "object") {
@@ -318,7 +352,10 @@ function extractResponseText(payload) {
 }
 
 function parseJsonFromText(text) {
-  const trimmed = safeString(text);
+  const trimmed = safeString(text)
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
   if (!trimmed) throw new Error("empty_model_response");
 
   try {
@@ -327,10 +364,54 @@ function parseJsonFromText(text) {
     const firstBrace = trimmed.indexOf("{");
     const lastBrace = trimmed.lastIndexOf("}");
     if (firstBrace >= 0 && lastBrace > firstBrace) {
-      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      try {
+        return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+      } catch {
+        // Continue with regex fallback.
+      }
     }
+
+    const cls =
+      trimmed.match(/["']?classification["']?\s*[:=]\s*["']?([A-Za-z_]+)["']?/i)?.[1] || "";
+    const confRaw =
+      trimmed.match(/["']?confidence["']?\s*[:=]\s*([0-9]*\.?[0-9]+)/i)?.[1] || "";
+    const conf = Number(confRaw);
+
+    if (cls && Number.isFinite(conf)) {
+      return { classification: cls, confidence: conf };
+    }
+
     throw new Error("invalid_json_response");
   }
+}
+
+function parseHttpStatusFromError(message) {
+  const match = safeString(message).match(/^openai_http_(\d+):/);
+  return match ? Number(match[1]) : null;
+}
+
+function isRetryableStatus(status) {
+  if (!Number.isFinite(status)) return false;
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+function isRetryableClassificationError(error) {
+  const message = safeString(error?.message || error).toLowerCase();
+  const status = parseHttpStatusFromError(message);
+
+  if (Number.isFinite(status) && isRetryableStatus(status)) return true;
+  if (message.includes("empty_model_response")) return true;
+  if (message.includes("invalid_json_response")) return true;
+  if (message.includes("fetch failed")) return true;
+  if (message.includes("etimedout")) return true;
+  if (message.includes("econnreset")) return true;
+  if (message.includes("socket hang up")) return true;
+  return false;
+}
+
+function getRetryDelayMs(attempt, baseDelayMs) {
+  const jitter = Math.floor(Math.random() * 350);
+  return baseDelayMs * Math.max(1, attempt) + jitter;
 }
 
 function normalizeClassification(result) {
@@ -350,7 +431,7 @@ function normalizeClassification(result) {
 }
 
 async function classifyWithOpenAI({ apiKey, model, promptText }) {
-  const requestBody = {
+  const makeRequestBody = (suffix = "") => ({
     model,
     max_output_tokens: 400,
     text: {
@@ -388,71 +469,48 @@ async function classifyWithOpenAI({ apiKey, model, promptText }) {
       },
       {
         role: "user",
-        content: [{ type: "input_text", text: promptText }],
+        content: [
+          {
+            type: "input_text",
+            text: `${promptText}${suffix}`,
+          },
+        ],
       },
     ],
-  };
-
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(requestBody),
   });
 
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`openai_http_${response.status}:${safeString(errorBody).slice(0, 300)}`);
-  }
+  for (let pass = 1; pass <= 2; pass += 1) {
+    const suffix =
+      pass === 1
+        ? ""
+        : "\n\nIMPORTANT: respond with raw JSON object only. No markdown, no prose.";
 
-  const payload = await response.json();
-  let outputText = extractResponseText(payload);
-
-  // gpt-5-mini can occasionally return no text despite 200 responses.
-  // Retry once with a simplified request if that happens.
-  if (!safeString(outputText)) {
-    const retryResponse = await fetch("https://api.openai.com/v1/responses", {
+    const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({
-        model,
-        max_output_tokens: 400,
-        input: [
-          {
-            role: "system",
-            content: "Return ONLY JSON with keys classification and confidence.",
-          },
-          {
-            role: "user",
-            content: `${promptText}\n\nReturn JSON now.`,
-          },
-        ],
-      }),
+      body: JSON.stringify(makeRequestBody(suffix)),
     });
 
-    if (!retryResponse.ok) {
-      const retryErrorBody = await retryResponse.text();
-      throw new Error(
-        `empty_model_response_retry_failed:${retryResponse.status}:${safeString(
-          retryErrorBody
-        ).slice(0, 300)}`
-      );
+    if (!response.ok) {
+      const errorBody = await response.text();
+      throw new Error(`openai_http_${response.status}:${safeString(errorBody).slice(0, 300)}`);
     }
 
-    const retryPayload = await retryResponse.json();
-    outputText = extractResponseText(retryPayload);
+    const payload = await response.json();
+    const outputText = extractResponseText(payload);
     if (!safeString(outputText)) {
+      if (pass < 2) continue;
       throw new Error("empty_model_response");
     }
+
+    const parsed = parseJsonFromText(outputText);
+    return normalizeClassification(parsed);
   }
 
-  const parsed = parseJsonFromText(outputText);
-  return normalizeClassification(parsed);
+  throw new Error("empty_model_response");
 }
 
 async function main() {
@@ -474,6 +532,20 @@ async function main() {
   loadLocalEnv();
   const apiKey = safeString(process.env.OPENAI_API_KEY);
   const model = safeString(process.env.OPENAI_MODEL) || DEFAULT_MODEL;
+  const classifyMaxAttempts = Math.max(
+    1,
+    Number.parseInt(
+      safeString(process.env.AI_CLASSIFY_MAX_ATTEMPTS) || String(DEFAULT_CLASSIFY_MAX_ATTEMPTS),
+      10
+    ) || DEFAULT_CLASSIFY_MAX_ATTEMPTS
+  );
+  const retryBaseDelayMs = Math.max(
+    250,
+    Number.parseInt(
+      safeString(process.env.AI_RETRY_BASE_DELAY_MS) || String(DEFAULT_RETRY_BASE_DELAY_MS),
+      10
+    ) || DEFAULT_RETRY_BASE_DELAY_MS
+  );
 
   if (!apiKey) {
     console.error("Missing OPENAI_API_KEY in environment or .env");
@@ -507,6 +579,7 @@ async function main() {
         resolvingUrl,
         activeSite: activeSiteValue,
         redorectedURL,
+        linkedinURL: "",
         txtName,
         classification: "",
         confidence: "",
@@ -526,6 +599,7 @@ async function main() {
         resolvingUrl,
         activeSite: activeSiteValue,
         redorectedURL,
+        linkedinURL: "",
         txtName,
         classification: "",
         confidence: "",
@@ -546,6 +620,7 @@ async function main() {
         resolvingUrl,
         activeSite: activeSiteValue,
         redorectedURL,
+        linkedinURL: "",
         txtName,
         classification: "",
         confidence: "",
@@ -559,13 +634,40 @@ async function main() {
     }
 
     const promptText = `${PROMPT_PREFIX}\n\n${extractedText}`;
+    const linkedinURL = extractLinkedinUrlFromPayload(extractedText);
 
     try {
-      const result = await classifyWithOpenAI({
-        apiKey,
-        model,
-        promptText,
-      });
+      let result = null;
+      let lastError = null;
+
+      for (let attempt = 1; attempt <= classifyMaxAttempts; attempt += 1) {
+        try {
+          result = await classifyWithOpenAI({
+            apiKey,
+            model,
+            promptText,
+          });
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          const canRetry =
+            attempt < classifyMaxAttempts && isRetryableClassificationError(error);
+          if (!canRetry) break;
+
+          const waitMs = getRetryDelayMs(attempt, retryBaseDelayMs);
+          console.warn(
+            `Retrying AI call (${attempt}/${classifyMaxAttempts}) for ${rawDomain} after error: ${safeString(
+              error?.message || error
+            )} [wait ${waitMs}ms]`
+          );
+          await sleep(waitMs);
+        }
+      }
+
+      if (!result) {
+        throw lastError || new Error("classification_failed");
+      }
 
       resultsRows = upsertResultRow(resultsRows, {
         processedAtUtc,
@@ -573,6 +675,7 @@ async function main() {
         resolvingUrl,
         activeSite: activeSiteValue,
         redorectedURL,
+        linkedinURL,
         txtName,
         classification: result.classification,
         confidence: result.confidence,
@@ -589,6 +692,7 @@ async function main() {
         resolvingUrl,
         activeSite: activeSiteValue,
         redorectedURL,
+        linkedinURL,
         txtName,
         classification: "",
         confidence: "",
